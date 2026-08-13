@@ -34,9 +34,9 @@ def log_signal(asset, direction, entry, sl, tp, score, timestamp):
       "Timestamp": timestamp,
       "Asset": asset,
       "Signal": direction,
-      "Entry": entry,
-      "SL": sl,
-      "TP": tp,
+      "Entry": round(entry, 4),
+      "SL": round(sl, 4),
+      "TP": round(tp, 4),
       "Confluence": f"{score}%",
       "Status": "ACTIVE",
   }
@@ -80,9 +80,65 @@ def fetch_oanda_candles(client, instrument, granularity="M1", count=30):
     return None
 
 
+def evaluate_open_trades(client):
+  """Checks active signals against current OANDA prices to resolve WIN / LOSS."""
+  if not os.path.exists(LOG_FILE):
+    return
+
+  df = pd.read_csv(LOG_FILE)
+  if df.empty or "Status" not in df.columns:
+    return
+
+  active_trades = df[df["Status"] == "ACTIVE"]
+  if active_trades.empty:
+    return
+
+  updated = False
+  for idx, row in active_trades.iterrows():
+    asset_name = row["Asset"]
+    symbol = ASSET_GRID.get(asset_name)
+    if not symbol:
+      continue
+
+    candles = fetch_oanda_candles(client, symbol, granularity="M1", count=2)
+    if candles is None or candles.empty:
+      continue
+
+    latest = candles.iloc[-1]
+    curr_high = latest["high"]
+    curr_low = latest["low"]
+
+    entry = float(row["Entry"])
+    sl = float(row["SL"])
+    tp = float(row["TP"])
+    is_buy = "BULLISH" in str(row["Signal"])
+
+    if is_buy:
+      if curr_high >= tp:
+        df.at[idx, "Status"] = "WIN 🟢"
+        updated = True
+      elif curr_low <= sl:
+        df.at[idx, "Status"] = "LOSS 🔴"
+        updated = True
+    else:  # Sell trade
+      if curr_low <= tp:
+        df.at[idx, "Status"] = "WIN 🟢"
+        updated = True
+      elif curr_high >= sl:
+        df.at[idx, "Status"] = "LOSS 🔴"
+        updated = True
+
+  if updated:
+    df.to_csv(LOG_FILE, index=False)
+
+
 def run_scanner_cycle(client):
   timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
+  # First resolve existing open trades
+  evaluate_open_trades(client)
+
+  # Scan for new signals
   for name, symbol in ASSET_GRID.items():
     df_ltf = fetch_oanda_candles(client, symbol, granularity="M1", count=30)
     df_htf = fetch_oanda_candles(client, symbol, granularity="H1", count=50)
@@ -142,7 +198,7 @@ def run_scanner_cycle(client):
 
 def background_worker():
   client = API(access_token=OANDA_ACCESS_TOKEN, environment=OANDA_ENV)
-  print("OANDA Market Scanner Engine Started.")
+  print("OANDA Market Scanner & Evaluator Engine Started.")
   while True:
     try:
       run_scanner_cycle(client)
@@ -151,7 +207,6 @@ def background_worker():
     time.sleep(60)
 
 
-# Start background worker thread safely on startup
 if not any(
     thread.name == "OandaScannerThread" for thread in threading.enumerate()
 ):
@@ -166,22 +221,28 @@ st.set_page_config(
 )
 
 st.title("⚡ OANDA Institutional Market Terminal")
-st.write("Live SMC Liquidity Sweep Engine & Signal Monitor")
-
-# Metrics Display
-col1, col2, col3, col4 = st.columns(4)
+st.write("Live SMC Liquidity Sweep Engine & Performance Monitor")
 
 if os.path.exists(LOG_FILE):
   df_logs = pd.read_csv(LOG_FILE)
   total_signals = len(df_logs)
+  wins = len(df_logs[df_logs["Status"] == "WIN 🟢"])
+  losses = len(df_logs[df_logs["Status"] == "LOSS 🔴"])
+  resolved = wins + losses
+  win_rate = f"{(wins / resolved * 100):.1f}%" if resolved > 0 else "N/A"
 else:
   df_logs = pd.DataFrame()
   total_signals = 0
+  wins = 0
+  losses = 0
+  win_rate = "N/A"
 
+col1, col2, col3, col4, col5 = st.columns(5)
 col1.metric("Engine Status", "🟢 ONLINE")
 col2.metric("Assets Monitored", len(ASSET_GRID))
 col3.metric("Total Signals Fired", total_signals)
-col4.metric("Scan Frequency", "60 Seconds")
+col4.metric("Win Rate", win_rate)
+col5.metric("Wins / Losses", f"{wins}W - {losses}L")
 
 st.divider()
 
