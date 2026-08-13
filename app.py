@@ -52,7 +52,8 @@ def send_telegram_alert(message):
 
 
 def fetch_oanda_candles(client, instrument, granularity="M1", count=30):
-  params = {"count": count, "granularity": granularity}
+  # Requesting Mid, Bid, and Ask ('MBA') to account for spread
+  params = {"count": count, "granularity": granularity, "price": "MBA"}
   req = instruments.InstrumentsCandles(instrument=instrument, params=params)
   try:
     client.request(req)
@@ -66,6 +67,8 @@ def fetch_oanda_candles(client, instrument, granularity="M1", count=30):
             "high": float(c["mid"]["h"]),
             "low": float(c["mid"]["l"]),
             "close": float(c["mid"]["c"]),
+            "bid_close": float(c["bid"]["c"]),
+            "ask_close": float(c["ask"]["c"]),
         })
     return pd.DataFrame(records)
   except Exception as e:
@@ -90,8 +93,8 @@ def run_scanner(client):
     recent_high = df_ltf["high"].iloc[-21:-1].max()
     recent_low = df_ltf["low"].iloc[-21:-1].min()
     latest = df_ltf.iloc[-1]
-    close_price = latest["close"]
 
+    close_price = latest["close"]
     bull_sweep = (latest["low"] < recent_low) and (close_price > recent_low)
     bear_sweep = (latest["high"] > recent_high) and (close_price < recent_high)
 
@@ -109,14 +112,26 @@ def run_scanner(client):
     )
 
     if score >= 65 and (bull_sweep or bear_sweep):
-      direction = (
-          "🟢 BULLISH SWEEP" if bull_sweep else "🔴 BEARISH SWEEP"
-      )
+      if bull_sweep:
+        direction = "🟢 BULLISH SWEEP (BUY)"
+        exec_price = latest["ask_close"]  # Actual Buy entry (Ask)
+        sl_price = latest["low"] - (exec_price * 0.0002)  # Below sweep low
+        risk = exec_price - sl_price
+        tp_price = exec_price + (risk * 2.0)  # 1:2 RRR
+      else:
+        direction = "🔴 BEARISH SWEEP (SELL)"
+        exec_price = latest["bid_close"]  # Actual Sell entry (Bid)
+        sl_price = latest["high"] + (exec_price * 0.0002)  # Above sweep high
+        risk = sl_price - exec_price
+        tp_price = exec_price - (risk * 2.0)  # 1:2 RRR
+
       msg = (
           f"🚨 <b>OANDA INSTITUTIONAL SIGNAL</b> 🚨\n\n"
           f"<b>Asset:</b> {name}\n"
-          f"<b>Signal:</b> {direction}\n"
-          f"<b>Execution Price:</b> ${close_price:.4f}\n"
+          f"<b>Signal:</b> {direction}\n\n"
+          f"<b>Entry (Spread Adjusted):</b> ${exec_price:.4f}\n"
+          f"<b>Stop Loss (SL):</b> ${sl_price:.4f}\n"
+          f"<b>Take Profit (TP):</b> ${tp_price:.4f} (1:2 RRR)\n\n"
           f"<b>Confluence Score:</b> {score}%\n"
           f"<b>Timestamp:</b> {timestamp}"
       )
@@ -135,7 +150,7 @@ def start_loop():
 
 
 if __name__ == "__main__":
-  # Start Web Server in background for Render
+  # Start Web Server in background for Render health check
   threading.Thread(target=run_health_server, daemon=True).start()
   # Run continuous trading loop
   start_loop()
