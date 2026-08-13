@@ -1,13 +1,15 @@
+from datetime import datetime, timezone
 import os
+import sys
 import threading
 import time
-from datetime import datetime, timezone
-from http.server import HTTPServer, SimpleHTTPRequestHandler
 import oandapyV20
 from oandapyV20 import API
 import oandapyV20.endpoints.instruments as instruments
 import pandas as pd
 import requests
+import streamlit as st
+from streamlit.web import cli as stcli
 
 # Credentials
 OANDA_ACCESS_TOKEN = (
@@ -26,20 +28,31 @@ ASSET_GRID = {
     "Crude Oil": "WTICO_USD",
 }
 
+# Global database for signal logs (accessible by both Scanner and Streamlit UI)
+if "signal_history" not in st.session_state:
+  st.session_state["signal_history"] = []
 
-# Simple HTTP Handler to satisfy Render's port binding requirement
-class HealthCheckHandler(SimpleHTTPRequestHandler):
-
-  def do_GET(self):
-    self.send_response(200)
-    self.end_headers()
-    self.wfile.write(b"OANDA Agent Active")
+# Persistent file storage for trade logs
+LOG_FILE = "trade_history.csv"
 
 
-def run_health_server():
-  port = int(os.environ.get("PORT", 10000))
-  server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-  server.serve_forever()
+def log_signal(asset, direction, entry, sl, tp, score, timestamp):
+  trade_data = {
+      "Timestamp": timestamp,
+      "Asset": asset,
+      "Signal": direction,
+      "Entry": entry,
+      "SL": sl,
+      "TP": tp,
+      "Confluence": f"{score}%",
+      "Status": "ACTIVE",
+  }
+
+  df = pd.DataFrame([trade_data])
+  if not os.path.exists(LOG_FILE):
+    df.to_csv(LOG_FILE, index=False)
+  else:
+    df.to_csv(LOG_FILE, mode="a", header=False, index=False)
 
 
 def send_telegram_alert(message):
@@ -52,7 +65,6 @@ def send_telegram_alert(message):
 
 
 def fetch_oanda_candles(client, instrument, granularity="M1", count=30):
-  # Requesting Mid, Bid, and Ask ('MBA') to account for spread
   params = {"count": count, "granularity": granularity, "price": "MBA"}
   req = instruments.InstrumentsCandles(instrument=instrument, params=params)
   try:
@@ -78,7 +90,6 @@ def fetch_oanda_candles(client, instrument, granularity="M1", count=30):
 
 def run_scanner(client):
   timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-  print(f"\n⚡ --- OANDA LIVE SCANNER PASS | {timestamp} ---")
 
   for name, symbol in ASSET_GRID.items():
     df_ltf = fetch_oanda_candles(client, symbol, granularity="M1", count=30)
@@ -106,24 +117,30 @@ def run_scanner(client):
     if 7 <= datetime.now(timezone.utc).hour <= 16:
       score += 20
 
-    print(
-        f"Asset: {name:15s} | Live Close: ${close_price:<9.4f} | Confluence:"
-        f" {score}%"
-    )
-
     if score >= 65 and (bull_sweep or bear_sweep):
       if bull_sweep:
         direction = "🟢 BULLISH SWEEP (BUY)"
-        exec_price = latest["ask_close"]  # Actual Buy entry (Ask)
-        sl_price = latest["low"] - (exec_price * 0.0002)  # Below sweep low
+        exec_price = latest["ask_close"]
+        sl_price = latest["low"] - (exec_price * 0.0002)
         risk = exec_price - sl_price
-        tp_price = exec_price + (risk * 2.0)  # 1:2 RRR
+        tp_price = exec_price + (risk * 2.0)
       else:
         direction = "🔴 BEARISH SWEEP (SELL)"
-        exec_price = latest["bid_close"]  # Actual Sell entry (Bid)
-        sl_price = latest["high"] + (exec_price * 0.0002)  # Above sweep high
+        exec_price = latest["bid_close"]
+        sl_price = latest["high"] + (exec_price * 0.0002)
         risk = sl_price - exec_price
-        tp_price = exec_price - (risk * 2.0)  # 1:2 RRR
+        tp_price = exec_price - (risk * 2.0)
+
+      # Log signal locally
+      log_signal(
+          name,
+          direction,
+          exec_price,
+          sl_price,
+          tp_price,
+          score,
+          timestamp,
+      )
 
       msg = (
           f"🚨 <b>OANDA INSTITUTIONAL SIGNAL</b> 🚨\n\n"
@@ -138,19 +155,70 @@ def run_scanner(client):
       send_telegram_alert(msg)
 
 
-def start_loop():
+def start_scanner_loop():
   client = API(access_token=OANDA_ACCESS_TOKEN, environment=OANDA_ENV)
-  print("Connected to OANDA API. Agent loop starting...")
+  print("Connected to OANDA API. Background Scanner Loop active.")
   while True:
     try:
       run_scanner(client)
     except Exception as e:
-      print(f"Execution Error: {e}")
+      print(f"Scanner Execution Error: {e}")
     time.sleep(60)
 
 
+def build_dashboard():
+  st.set_page_config(
+      page_title="Institutional Scanner Terminal",
+      page_icon="⚡",
+      layout="wide",
+  )
+
+  st.title("⚡ OANDA Institutional Market Terminal")
+  st.write("Live SMC Liquidity Sweep Engine & Signal Monitor")
+
+  # Metrics Row
+  col1, col2, col3, col4 = st.columns(4)
+
+  if os.path.exists(LOG_FILE):
+    df_logs = pd.read_csv(LOG_FILE)
+    total_signals = len(df_logs)
+  else:
+    df_logs = pd.DataFrame()
+    total_signals = 0
+
+  col1.metric("Engine Status", "🟢 ONLINE")
+  col2.metric("Assets Monitored", len(ASSET_GRID))
+  col3.metric("Total Signals Fired", total_signals)
+  col4.metric("Scan Frequency", "60 Seconds")
+
+  st.divider()
+
+  # Active Signals & History Table
+  st.subheader("📋 Trade Signal Performance Log")
+  if not df_logs.empty:
+    st.dataframe(df_logs.iloc[::-1], use_container_width=True)
+  else:
+    st.info(
+        "No signals logged yet. The terminal is actively scanning for high-confluence setups..."
+    )
+
+
 if __name__ == "__main__":
-  # Start Web Server in background for Render health check
-  threading.Thread(target=run_health_server, daemon=True).start()
-  # Run continuous trading loop
-  start_loop()
+  # Start background scanner loop
+  threading.Thread(target=start_scanner_loop, daemon=True).start()
+
+  # Launch Streamlit app binding to Render port
+  port = int(os.environ.get("PORT", 10000))
+  sys.argv = [
+      "streamlit",
+      "run",
+      "app.py",
+      "--server.port",
+      str(port),
+      "--server.address",
+      "0.0.0.0",
+  ]
+  sys.exit(stcli.main())
+else:
+  # Render calls this when rendering Streamlit page
+  build_dashboard()
