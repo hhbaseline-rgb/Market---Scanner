@@ -1,6 +1,5 @@
 from datetime import datetime, timezone
 import os
-import sys
 import threading
 import time
 import oandapyV20
@@ -9,7 +8,11 @@ import oandapyV20.endpoints.instruments as instruments
 import pandas as pd
 import requests
 import streamlit as st
-from streamlit.web import cli as stcli
+
+# Page setup
+st.set_page_config(
+    page_title="Institutional Scanner Terminal", page_icon="⚡", layout="wide"
+)
 
 # Credentials
 OANDA_ACCESS_TOKEN = (
@@ -28,11 +31,6 @@ ASSET_GRID = {
     "Crude Oil": "WTICO_USD",
 }
 
-# Global database for signal logs (accessible by both Scanner and Streamlit UI)
-if "signal_history" not in st.session_state:
-  st.session_state["signal_history"] = []
-
-# Persistent file storage for trade logs
 LOG_FILE = "trade_history.csv"
 
 
@@ -47,7 +45,6 @@ def log_signal(asset, direction, entry, sl, tp, score, timestamp):
       "Confluence": f"{score}%",
       "Status": "ACTIVE",
   }
-
   df = pd.DataFrame([trade_data])
   if not os.path.exists(LOG_FILE):
     df.to_csv(LOG_FILE, index=False)
@@ -131,7 +128,6 @@ def run_scanner(client):
         risk = sl_price - exec_price
         tp_price = exec_price - (risk * 2.0)
 
-      # Log signal locally
       log_signal(
           name,
           direction,
@@ -155,70 +151,52 @@ def run_scanner(client):
       send_telegram_alert(msg)
 
 
-def start_scanner_loop():
-  client = API(access_token=OANDA_ACCESS_TOKEN, environment=OANDA_ENV)
-  print("Connected to OANDA API. Background Scanner Loop active.")
-  while True:
-    try:
-      run_scanner(client)
-    except Exception as e:
-      print(f"Scanner Execution Error: {e}")
-    time.sleep(60)
+# Safely start the market scanner background thread ONCE
+@st.cache_resource
+def start_background_scanner():
+  def loop():
+    client = API(access_token=OANDA_ACCESS_TOKEN, environment=OANDA_ENV)
+    while True:
+      try:
+        run_scanner(client)
+      except Exception as e:
+        print(f"Scanner Loop Error: {e}")
+      time.sleep(60)
+
+  thread = threading.Thread(target=loop, daemon=True)
+  thread.start()
+  return thread
 
 
-def build_dashboard():
-  st.set_page_config(
-      page_title="Institutional Scanner Terminal",
-      page_icon="⚡",
-      layout="wide",
-  )
+# Trigger background engine
+start_background_scanner()
 
-  st.title("⚡ OANDA Institutional Market Terminal")
-  st.write("Live SMC Liquidity Sweep Engine & Signal Monitor")
+# Render Web Dashboard
+st.title("⚡ OANDA Institutional Market Terminal")
+st.write("Live SMC Liquidity Sweep Engine & Signal Monitor")
 
-  # Metrics Row
-  col1, col2, col3, col4 = st.columns(4)
+# Metrics Cards
+col1, col2, col3, col4 = st.columns(4)
 
-  if os.path.exists(LOG_FILE):
-    df_logs = pd.read_csv(LOG_FILE)
-    total_signals = len(df_logs)
-  else:
-    df_logs = pd.DataFrame()
-    total_signals = 0
-
-  col1.metric("Engine Status", "🟢 ONLINE")
-  col2.metric("Assets Monitored", len(ASSET_GRID))
-  col3.metric("Total Signals Fired", total_signals)
-  col4.metric("Scan Frequency", "60 Seconds")
-
-  st.divider()
-
-  # Active Signals & History Table
-  st.subheader("📋 Trade Signal Performance Log")
-  if not df_logs.empty:
-    st.dataframe(df_logs.iloc[::-1], use_container_width=True)
-  else:
-    st.info(
-        "No signals logged yet. The terminal is actively scanning for high-confluence setups..."
-    )
-
-
-if __name__ == "__main__":
-  # Start background scanner loop
-  threading.Thread(target=start_scanner_loop, daemon=True).start()
-
-  # Launch Streamlit app binding to Render port
-  port = int(os.environ.get("PORT", 10000))
-  sys.argv = [
-      "streamlit",
-      "run",
-      "app.py",
-      "--server.port",
-      str(port),
-      "--server.address",
-      "0.0.0.0",
-  ]
-  sys.exit(stcli.main())
+if os.path.exists(LOG_FILE):
+  df_logs = pd.read_csv(LOG_FILE)
+  total_signals = len(df_logs)
 else:
-  # Render calls this when rendering Streamlit page
-  build_dashboard()
+  df_logs = pd.DataFrame()
+  total_signals = 0
+
+col1.metric("Engine Status", "🟢 ONLINE")
+col2.metric("Assets Monitored", len(ASSET_GRID))
+col3.metric("Total Signals Fired", total_signals)
+col4.metric("Scan Frequency", "60 Seconds")
+
+st.divider()
+
+st.subheader("📋 Trade Signal Performance Log")
+if not df_logs.empty:
+  st.dataframe(df_logs.iloc[::-1], use_container_width=True)
+else:
+  st.info(
+      "No signals logged yet. The terminal is actively scanning for"
+      " high-confluence setups..."
+  )
