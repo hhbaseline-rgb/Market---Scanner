@@ -9,12 +9,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-# Page setup
-st.set_page_config(
-    page_title="Institutional Scanner Terminal", page_icon="⚡", layout="wide"
-)
-
-# Credentials
+# Configuration & Credentials
 OANDA_ACCESS_TOKEN = (
     "d1c8211fcc0fe62f6c68279e79da11d6-f2d0f1af9b595a5589c6e30559db5712"
 )
@@ -85,7 +80,7 @@ def fetch_oanda_candles(client, instrument, granularity="M1", count=30):
     return None
 
 
-def run_scanner(client):
+def run_scanner_cycle(client):
   timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
   for name, symbol in ASSET_GRID.items():
@@ -129,13 +124,7 @@ def run_scanner(client):
         tp_price = exec_price - (risk * 2.0)
 
       log_signal(
-          name,
-          direction,
-          exec_price,
-          sl_price,
-          tp_price,
-          score,
-          timestamp,
+          name, direction, exec_price, sl_price, tp_price, score, timestamp
       )
 
       msg = (
@@ -151,31 +140,35 @@ def run_scanner(client):
       send_telegram_alert(msg)
 
 
-# Safely start the market scanner background thread ONCE
-@st.cache_resource
-def start_background_scanner():
-  def loop():
-    client = API(access_token=OANDA_ACCESS_TOKEN, environment=OANDA_ENV)
-    while True:
-      try:
-        run_scanner(client)
-      except Exception as e:
-        print(f"Scanner Loop Error: {e}")
-      time.sleep(60)
-
-  thread = threading.Thread(target=loop, daemon=True)
-  thread.start()
-  return thread
+def background_worker():
+  client = API(access_token=OANDA_ACCESS_TOKEN, environment=OANDA_ENV)
+  print("OANDA Market Scanner Engine Started.")
+  while True:
+    try:
+      run_scanner_cycle(client)
+    except Exception as e:
+      print(f"Scanner Loop Error: {e}")
+    time.sleep(60)
 
 
-# Trigger background engine
-start_background_scanner()
+# Start background worker thread safely on startup
+if not any(
+    thread.name == "OandaScannerThread" for thread in threading.enumerate()
+):
+  scanner_thread = threading.Thread(
+      target=background_worker, name="OandaScannerThread", daemon=True
+  )
+  scanner_thread.start()
 
-# Render Web Dashboard
+# --- STREAMLIT DASHBOARD UI ---
+st.set_page_config(
+    page_title="Institutional Scanner Terminal", page_icon="⚡", layout="wide"
+)
+
 st.title("⚡ OANDA Institutional Market Terminal")
 st.write("Live SMC Liquidity Sweep Engine & Signal Monitor")
 
-# Metrics Cards
+# Metrics Display
 col1, col2, col3, col4 = st.columns(4)
 
 if os.path.exists(LOG_FILE):
