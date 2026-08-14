@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import os
 import threading
 import time
@@ -9,7 +9,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-# Configuration & Credentials
+# Credentials & Config
 OANDA_ACCESS_TOKEN = (
     "d1c8211fcc0fe62f6c68279e79da11d6-f2d0f1af9b595a5589c6e30559db5712"
 )
@@ -17,28 +17,36 @@ OANDA_ENV = "practice"
 TELEGRAM_BOT_TOKEN = "8701985481:AAFEaUEuEHz0ZpsRNnaXeXUV-sHJzoV8NpE"
 TELEGRAM_CHAT_ID = "8891498417"
 
+# FOREX MAJORS & CROSSES ONLY
 ASSET_GRID = {
-    "Gold (XAU/USD)": "XAU_USD",
     "EUR/USD": "EUR_USD",
     "GBP/USD": "GBP_USD",
     "USD/JPY": "USD_JPY",
     "GBP/JPY": "GBP_JPY",
-    "Crude Oil": "WTICO_USD",
+    "AUD/USD": "AUD_USD",
+    "USD/CAD": "USD_CAD",
 }
 
-LOG_FILE = "trade_history.csv"
+# Persistent storage compatibility (for Render disk or local)
+LOG_FILE = (
+    "/var/data/trade_history.csv"
+    if os.path.exists("/var/data")
+    else "trade_history.csv"
+)
+COOLDOWN_TRACKER = {}
 
 
-def log_signal(asset, direction, entry, sl, tp, score, timestamp):
+def log_signal(asset, direction, entry, sl, tp, score, timestamp, notes=""):
   trade_data = {
       "Timestamp": timestamp,
       "Asset": asset,
       "Signal": direction,
-      "Entry": round(entry, 4),
-      "SL": round(sl, 4),
-      "TP": round(tp, 4),
+      "Entry": round(entry, 5),
+      "SL": round(sl, 5),
+      "TP": round(tp, 5),
       "Confluence": f"{score}%",
       "Status": "ACTIVE",
+      "Setup": notes,
   }
   df = pd.DataFrame([trade_data])
   if not os.path.exists(LOG_FILE):
@@ -56,7 +64,7 @@ def send_telegram_alert(message):
     print(f"Telegram error: {e}")
 
 
-def fetch_oanda_candles(client, instrument, granularity="M1", count=30):
+def fetch_oanda_candles(client, instrument, granularity="H1", count=50):
   params = {"count": count, "granularity": granularity, "price": "MBA"}
   req = instruments.InstrumentsCandles(instrument=instrument, params=params)
   try:
@@ -80,8 +88,15 @@ def fetch_oanda_candles(client, instrument, granularity="M1", count=30):
     return None
 
 
+def calculate_atr(df, period=14):
+  high_low = df["high"] - df["low"]
+  high_cp = (df["high"] - df["close"].shift(1)).abs()
+  low_cp = (df["low"] - df["close"].shift(1)).abs()
+  tr = pd.concat([high_low, high_cp, low_cp], axis=1).max(axis=1)
+  return tr.rolling(period).mean().iloc[-1]
+
+
 def evaluate_open_trades(client):
-  """Checks active signals against current OANDA prices to resolve WIN / LOSS."""
   if not os.path.exists(LOG_FILE):
     return
 
@@ -100,7 +115,7 @@ def evaluate_open_trades(client):
     if not symbol:
       continue
 
-    candles = fetch_oanda_candles(client, symbol, granularity="M1", count=2)
+    candles = fetch_oanda_candles(client, symbol, granularity="H1", count=2)
     if candles is None or candles.empty:
       continue
 
@@ -120,7 +135,7 @@ def evaluate_open_trades(client):
       elif curr_low <= sl:
         df.at[idx, "Status"] = "LOSS 🔴"
         updated = True
-    else:  # Sell trade
+    else:
       if curr_low <= tp:
         df.at[idx, "Status"] = "WIN 🟢"
         updated = True
@@ -133,78 +148,97 @@ def evaluate_open_trades(client):
 
 
 def run_scanner_cycle(client):
-  timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+  now_utc = datetime.now(timezone.utc)
+  timestamp_str = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
 
-  # First resolve existing open trades
   evaluate_open_trades(client)
 
-  # Scan for new signals
   for name, symbol in ASSET_GRID.items():
-    df_ltf = fetch_oanda_candles(client, symbol, granularity="M1", count=30)
-    df_htf = fetch_oanda_candles(client, symbol, granularity="H1", count=50)
+    # 8-Hour Cooldown per asset to enforce strict patience
+    if symbol in COOLDOWN_TRACKER:
+      if now_utc - COOLDOWN_TRACKER[symbol] < timedelta(hours=8):
+        continue
 
-    if df_ltf is None or df_htf is None or df_ltf.empty or df_htf.empty:
+    # Fetch Daily (D) for Macro Liquidity Pools and H1 for Structure
+    df_daily = fetch_oanda_candles(client, symbol, granularity="D", count=10)
+    df_h1 = fetch_oanda_candles(client, symbol, granularity="H1", count=50)
+
+    if (
+        df_daily is None
+        or df_h1 is None
+        or len(df_daily) < 2
+        or len(df_h1) < 20
+    ):
       continue
 
-    df_htf["EMA50"] = df_htf["close"].ewm(span=50).mean()
-    htf_bullish = df_htf["close"].iloc[-1] > df_htf["EMA50"].iloc[-1]
+    # 1. Macro Liquidity Levels (Previous Day High & Low)
+    pdh = df_daily["high"].iloc[-2]
+    pdl = df_daily["low"].iloc[-2]
 
-    recent_high = df_ltf["high"].iloc[-21:-1].max()
-    recent_low = df_ltf["low"].iloc[-21:-1].min()
-    latest = df_ltf.iloc[-1]
+    # 2. H1 Market Structure Confirmation
+    latest_h1 = df_h1.iloc[-1]
+    h1_atr = calculate_atr(df_h1)
 
-    close_price = latest["close"]
-    bull_sweep = (latest["low"] < recent_low) and (close_price > recent_low)
-    bear_sweep = (latest["high"] > recent_high) and (close_price < recent_high)
+    # Bullish: Price raided Previous Day Low, but closed back above
+    pd_bull_raid = (latest_h1["low"] < pdl) and (latest_h1["close"] > pdl)
 
-    score = 0
-    if htf_bullish:
-      score += 35
-    if bull_sweep or bear_sweep:
-      score += 45
-    if 7 <= datetime.now(timezone.utc).hour <= 16:
-      score += 20
+    # Bearish: Price raided Previous Day High, but closed back below
+    pd_bear_raid = (latest_h1["high"] > pdh) and (latest_h1["close"] < pdh)
 
-    if score >= 65 and (bull_sweep or bear_sweep):
-      if bull_sweep:
-        direction = "🟢 BULLISH SWEEP (BUY)"
-        exec_price = latest["ask_close"]
-        sl_price = latest["low"] - (exec_price * 0.0002)
+    if pd_bull_raid or pd_bear_raid:
+      score = 90  # High macro confluence
+
+      if pd_bull_raid:
+        direction = "🟢 BULLISH MACRO REVERSAL (BUY)"
+        exec_price = latest_h1["ask_close"]
+        sl_price = min(latest_h1["low"], pdl) - (h1_atr * 0.75)
         risk = exec_price - sl_price
         tp_price = exec_price + (risk * 2.0)
+        setup_note = "Daily Low Raid + H1 Reversion"
+
       else:
-        direction = "🔴 BEARISH SWEEP (SELL)"
-        exec_price = latest["bid_close"]
-        sl_price = latest["high"] + (exec_price * 0.0002)
+        direction = "🔴 BEARISH MACRO REVERSAL (SELL)"
+        exec_price = latest_h1["bid_close"]
+        sl_price = max(latest_h1["high"], pdh) + (h1_atr * 0.75)
         risk = sl_price - exec_price
         tp_price = exec_price - (risk * 2.0)
+        setup_note = "Daily High Raid + H1 Reversion"
 
       log_signal(
-          name, direction, exec_price, sl_price, tp_price, score, timestamp
+          name,
+          direction,
+          exec_price,
+          sl_price,
+          tp_price,
+          score,
+          timestamp_str,
+          setup_note,
       )
+      COOLDOWN_TRACKER[symbol] = now_utc
 
       msg = (
-          f"🚨 <b>OANDA INSTITUTIONAL SIGNAL</b> 🚨\n\n"
+          f"🏆 <b>INSTITUTIONAL MACRO SIGNAL</b> 🏆\n\n"
           f"<b>Asset:</b> {name}\n"
+          f"<b>Setup:</b> {setup_note}\n"
           f"<b>Signal:</b> {direction}\n\n"
-          f"<b>Entry (Spread Adjusted):</b> ${exec_price:.4f}\n"
-          f"<b>Stop Loss (SL):</b> ${sl_price:.4f}\n"
-          f"<b>Take Profit (TP):</b> ${tp_price:.4f} (1:2 RRR)\n\n"
+          f"<b>Entry Price:</b> ${exec_price:.5f}\n"
+          f"<b>Macro Stop Loss:</b> ${sl_price:.5f}\n"
+          f"<b>Take Profit Target:</b> ${tp_price:.5f} (1:2 RRR)\n\n"
           f"<b>Confluence Score:</b> {score}%\n"
-          f"<b>Timestamp:</b> {timestamp}"
+          f"<b>Timestamp:</b> {timestamp_str}"
       )
       send_telegram_alert(msg)
 
 
 def background_worker():
   client = API(access_token=OANDA_ACCESS_TOKEN, environment=OANDA_ENV)
-  print("OANDA Market Scanner & Evaluator Engine Started.")
+  print("Macro Liquidity Structural Engine Started.")
   while True:
     try:
       run_scanner_cycle(client)
     except Exception as e:
       print(f"Scanner Loop Error: {e}")
-    time.sleep(60)
+    time.sleep(300)  # Runs cycle every 5 minutes
 
 
 if not any(
@@ -217,11 +251,14 @@ if not any(
 
 # --- STREAMLIT DASHBOARD UI ---
 st.set_page_config(
-    page_title="Institutional Scanner Terminal", page_icon="⚡", layout="wide"
+    page_title="Macro Structural Terminal", page_icon="🏛️", layout="wide"
 )
 
-st.title("⚡ OANDA Institutional Market Terminal")
-st.write("Live SMC Liquidity Sweep Engine & Performance Monitor")
+st.title("🏛️ Institutional Macro Terminal (Daily / H1)")
+st.write(
+    "Selling the Shovels: Tracking Daily Liquidity Raids & Macro Trend"
+    " Expansions"
+)
 
 if os.path.exists(LOG_FILE):
   df_logs = pd.read_csv(LOG_FILE)
@@ -240,17 +277,17 @@ else:
 col1, col2, col3, col4, col5 = st.columns(5)
 col1.metric("Engine Status", "🟢 ONLINE")
 col2.metric("Assets Monitored", len(ASSET_GRID))
-col3.metric("Total Signals Fired", total_signals)
+col3.metric("Total Macro Signals", total_signals)
 col4.metric("Win Rate", win_rate)
 col5.metric("Wins / Losses", f"{wins}W - {losses}L")
 
 st.divider()
 
-st.subheader("📋 Trade Signal Performance Log")
+st.subheader("📋 Macro Signal Performance Journal")
 if not df_logs.empty:
   st.dataframe(df_logs.iloc[::-1], use_container_width=True)
 else:
   st.info(
-      "No signals logged yet. The terminal is actively scanning for"
-      " high-confluence setups..."
+      "No signals logged yet. Patiently monitoring Previous Day High/Low raids"
+      " on H1 timeframe..."
   )
